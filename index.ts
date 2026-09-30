@@ -5,6 +5,7 @@ const app = express();
 app.use(express.json());
 
 const PORT = Number(process.env.PORT) || 3000;
+
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const MOOVE_API_KEY = process.env.MOOVE_API_KEY;
 
@@ -18,7 +19,12 @@ if (!MOOVE_API_KEY) {
 
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 
-async function telegram(method: string, body: Record<string, unknown>) {
+const awaitingAmount = new Set<number>();
+
+async function telegram(
+  method: string,
+  body: Record<string, unknown>
+) {
   const response = await fetch(`${TELEGRAM_API}/${method}`, {
     method: "POST",
     headers: {
@@ -32,7 +38,42 @@ async function telegram(method: string, body: Record<string, unknown>) {
   console.log(`Telegram ${method}:`, JSON.stringify(data));
 
   if (!response.ok || !data.ok) {
-    throw new Error(`Telegram API error: ${JSON.stringify(data)}`);
+    throw new Error(
+      `Telegram API error: ${JSON.stringify(data)}`
+    );
+  }
+
+  return data;
+}
+
+async function createMoovePaymentLink(amount: string) {
+  const response = await fetch(
+    "https://api.moove.xyz/v1/payment-link",
+    {
+      method: "POST",
+      headers: {
+        "X-API-Key": MOOVE_API_KEY!,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        toAmount: amount,
+        description: "RIA Telegram payment",
+        maxUsage: 1,
+      }),
+    }
+  );
+
+  const data = await response.json();
+
+  console.log(
+    "Moove payment-link response:",
+    JSON.stringify(data)
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      `Moove API error: ${JSON.stringify(data)}`
+    );
   }
 
   return data;
@@ -54,27 +95,27 @@ app.post("/telegram/webhook", async (req, res) => {
   console.log("TELEGRAM UPDATE RECEIVED");
   console.log(JSON.stringify(req.body, null, 2));
 
-  // Always acknowledge Telegram immediately
   res.sendStatus(200);
 
   try {
     const update = req.body;
 
-    // Handle normal messages
     if (update.message) {
       const message = update.message;
 
       const chatId = message.chat?.id;
-      const text = message.text;
+      const text = message.text?.trim();
+
+      if (!chatId || !text) {
+        return;
+      }
 
       console.log("Chat ID:", chatId);
       console.log("Message:", text);
 
-      if (!chatId) {
-        return;
-      }
-
       if (text === "/start") {
+        awaitingAmount.delete(chatId);
+
         const username = message.from?.username;
         const firstName = message.from?.first_name || "there";
 
@@ -105,12 +146,62 @@ app.post("/telegram/webhook", async (req, res) => {
           },
         });
 
-        console.log("WELCOME MESSAGE SENT");
         return;
       }
+
+      if (awaitingAmount.has(chatId)) {
+        const amount = Number(text);
+
+        if (!Number.isFinite(amount) || amount <= 0) {
+          await telegram("sendMessage", {
+            chat_id: chatId,
+            text: "Please enter a valid USD amount, for example: 50",
+          });
+
+          return;
+        }
+
+        awaitingAmount.delete(chatId);
+
+        await telegram("sendMessage", {
+          chat_id: chatId,
+          text: `Creating your $${amount.toFixed(2)} USDC payment link...`,
+        });
+
+        const payment = await createMoovePaymentLink(
+          amount.toFixed(2)
+        );
+
+        await telegram("sendMessage", {
+          chat_id: chatId,
+          text:
+            `💳 Payment Ready\n\n` +
+            `Amount: $${amount.toFixed(2)} USDC\n\n` +
+            `Tap below to pay.`,
+          reply_markup: {
+            inline_keyboard: [
+              [
+                {
+                  text: `Pay $${amount.toFixed(2)} USDC`,
+                  url: payment.url,
+                },
+              ],
+            ],
+          },
+        });
+
+        return;
+      }
+
+      await telegram("sendMessage", {
+        chat_id: chatId,
+        text:
+          "Please choose an option from the menu or type /start.",
+      });
+
+      return;
     }
 
-    // Handle button clicks
     if (update.callback_query) {
       const callback = update.callback_query;
 
@@ -120,7 +211,6 @@ app.post("/telegram/webhook", async (req, res) => {
       console.log("Button:", callbackData);
       console.log("Chat ID:", chatId);
 
-      // Remove Telegram's loading state on the button
       await telegram("answerCallbackQuery", {
         callback_query_id: callback.id,
       });
@@ -130,11 +220,14 @@ app.post("/telegram/webhook", async (req, res) => {
       }
 
       if (callbackData === "pay_crypto") {
+        awaitingAmount.add(chatId);
+
         await telegram("sendMessage", {
           chat_id: chatId,
           text:
             "💳 Pay with Crypto\n\n" +
-            "Enter the amount you want to pay.",
+            "Enter the amount in USD.\n\n" +
+            "Example: 50",
         });
 
         return;
@@ -145,7 +238,7 @@ app.post("/telegram/webhook", async (req, res) => {
           chat_id: chatId,
           text:
             "🔎 Check Payment\n\n" +
-            "Send me your Moove payment link ID.",
+            "Payment checking will be added next.",
         });
 
         return;
